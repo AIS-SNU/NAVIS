@@ -1,0 +1,1321 @@
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT license.
+ */
+#![warn(missing_debug_implementations)]
+use std::{
+    io::{Seek, SeekFrom, Write},
+    mem::size_of,
+    num::NonZeroUsize,
+    sync::atomic::AtomicBool,
+    time::Instant,
+    vec,
+};
+
+use crate::storage::{StorageReadProvider, StorageWriteProvider};
+use diskann::{
+    ANNError, ANNResult,
+    error::IntoANNResult,
+    utils::{VectorRepr, read_exact_into},
+};
+use diskann_quantization::{
+    CompressInto,
+    product::{BasicTableView, TransposedTable, train::TrainQuantizer},
+    views::{ChunkOffsets, ChunkOffsetsView},
+};
+use diskann_utils::{
+    io::Metadata,
+    views::{MatrixView, MutMatrixView},
+};
+use rand::{Rng, distr::Distribution};
+use rayon::prelude::*;
+use tracing::info;
+
+use crate::{
+    model::GeneratePivotArguments,
+    storage::PQStorage,
+    utils::{
+        BridgeErr, ParallelIteratorInPool, RandomProvider, RayonThreadPoolRef,
+        create_rnd_provider_from_seed,
+    },
+};
+
+/// Max size of PQ training set
+pub const MAX_PQ_TRAINING_SET_SIZE: f64 = 50_000f64;
+
+/// Number of PQ centroids for each chunk
+/// Caution: The PQ logic is designed and hardcoded to work with 256 centroids, be cafeul when changing this value.
+pub const NUM_PQ_CENTROIDS: usize = 256;
+
+/// number of k-means repetitions to run for PQ
+pub const NUM_KMEANS_REPS_PQ: usize = 12;
+
+impl<R> diskann_quantization::random::RngBuilder<usize> for RandomProvider<R>
+where
+    R: Rng,
+{
+    type Rng = R;
+    fn build_rng(&self, chunk_index: usize) -> Self::Rng {
+        self.create_rnd_from_seed(chunk_index as u64)
+    }
+}
+
+/// given training data in train_data of dimensions num_train * dim, generate
+/// PQ pivots using k-means algorithm to partition the co-ordinates into
+/// num_pq_chunks (if it divides dimension, else rounded) chunks, and runs
+/// k-means in each chunk to compute the PQ pivots and stores in bin format in
+/// file pq_pivots_path as a s num_centers*dim floating point binary file
+/// PQ pivot table layout: {pivot offsets data: METADATA_SIZE}{pivot vector:[dim; num_centroid]}{centroid vector:[dim; 1]}{chunk offsets:[chunk_num+1; 1]}
+///
+/// Argument `legacy_center_data` will center the provided data by the dataset mean.
+/// This is to supply backwards compatibility with some `diskann-disk` tests that used this
+/// feature and require exact reproducibility in some tests.
+///
+/// This argument should **only** be used if the distance metric being used is L2. Otherwise
+/// any computed distance on the resulting PQ compressed data will be incorrect.
+pub fn generate_pq_pivots<Storage, Random>(
+    parameters: GeneratePivotArguments,
+    legacy_center_data: bool,
+    train_data: &mut [f32],
+    pq_storage: &PQStorage,
+    storage_provider: &Storage,
+    random_provider: RandomProvider<Random>,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<()>
+where
+    Storage: StorageWriteProvider + StorageReadProvider,
+    Random: Rng,
+{
+    if pq_storage.pivot_data_exist(storage_provider) {
+        let (file_num_centers, file_dim) =
+            pq_storage.read_existing_pivot_metadata(storage_provider)?;
+        if file_dim == parameters.dim() && file_num_centers == parameters.num_centers() {
+            // PQ pivot file exists. Not generating again.
+            return Ok(());
+        }
+    }
+
+    let centroid = if legacy_center_data {
+        let mut centroid: Vec<f32> = vec![0.0; parameters.dim()];
+        move_train_data_by_centroid(
+            train_data,
+            parameters.num_train(),
+            parameters.dim(),
+            &mut centroid,
+        );
+        Some(centroid)
+    } else {
+        None
+    };
+
+    let dim = NonZeroUsize::new(parameters.dim())
+        .ok_or_else(|| ANNError::message("dim must be non-zero"))?;
+    let num_chunks = NonZeroUsize::new(parameters.num_pq_chunks())
+        .ok_or_else(|| ANNError::message("num_pq_chunks must be non-zero"))?;
+    let chunk_offsets = ChunkOffsets::partition(dim, num_chunks).bridge_err()?;
+
+    let trainer = diskann_quantization::product::train::LightPQTrainingParameters::new(
+        parameters.num_centers(),
+        parameters.max_k_means_reps(),
+    );
+
+    let full_pivot_data = pool.install(|| -> Result<Vec<f32>, ANNError> {
+        let result = trainer
+            .train(
+                MatrixView::try_from(train_data, parameters.num_train(), parameters.dim())
+                    .bridge_err()?,
+                chunk_offsets.as_view(),
+                diskann_quantization::Parallelism::Rayon,
+                &random_provider,
+                &diskann_quantization::cancel::DontCancel,
+            )
+            .map_err(ANNError::new)?
+            .flatten();
+        Ok(result)
+    })?;
+
+    pq_storage.write_pivot_data(
+        &full_pivot_data,
+        centroid.as_deref(),
+        chunk_offsets.as_slice(),
+        parameters.num_centers(),
+        parameters.dim(),
+        storage_provider,
+    )?;
+
+    Ok(())
+}
+
+/// Given `train_data_slice` of dimensions num_train * dim,
+/// partition the dimensions in `num_pq_chunks` chunks and generate PQ pivots
+/// using k-means++ init and k-means algorithm.
+/// This API doesn't involve reading/writing to disk and is used for in-memory.
+///
+/// If make_zero_mean is true, calculate the `centroid` of all the points and
+/// subtract the centroid from each point before running k-means.
+/// `centroid` is stored in the `centroid` vector which must be of size `dim`.
+///
+/// The `offsets` vector is used to store the start and end offsets of each chunk.
+/// The size of the `offsets` vector must be `num_pq_chunks + 1`.
+///
+/// Result is stored in the `full_pivot_data`, which must be of size `num_centers * dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_pq_pivots_from_membuf<T: Copy + Into<f32>>(
+    parameters: &GeneratePivotArguments,
+    train_data_slice: &[T],
+    offsets: &mut [usize],
+    full_pivot_data: &mut [f32],
+    rng: &mut (impl Rng + ?Sized),
+    cancellation_token: &mut bool,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<()> {
+    if full_pivot_data.len() != parameters.num_centers() * parameters.dim() {
+        return Err(ANNError::message(
+            "Error: full_pivot_data size is not num_centers * dim.",
+        ));
+    }
+
+    if offsets.len() != parameters.num_pq_chunks() + 1 {
+        return Err(ANNError::message(
+            "Error: invalid offsets buffer input size.",
+        ));
+    }
+
+    if *cancellation_token {
+        return Err(ANNError::message(
+            "Error: Cancellation requested by caller.",
+        ));
+    }
+
+    // Convert train_data to f32
+    let train_data = train_data_slice
+        .iter()
+        .map(|x| (*x).into())
+        .collect::<Vec<f32>>();
+
+    // Calculate the chunk offsets, filling the caller-owned buffer.
+    let dim = NonZeroUsize::new(parameters.dim())
+        .ok_or_else(|| ANNError::message("dim must be non-zero"))?;
+    let chunk_offsets_view = ChunkOffsetsView::partition_into(dim, offsets).bridge_err()?;
+
+    let trainer = diskann_quantization::product::train::LightPQTrainingParameters::new(
+        parameters.num_centers(),
+        parameters.max_k_means_reps(),
+    );
+
+    let rng_builder = create_rnd_provider_from_seed(rand::distr::StandardUniform {}.sample(rng));
+    let trained = pool.install(|| -> Result<Vec<f32>, ANNError> {
+        // SAFETY: The pointer for `cancellation_token` is valid for this local lifetime,
+        // and we do not otherwise access `cancellation_token`.
+        //
+        // The particular semantics of `cancellation_token` make it useless for cancellation
+        // in a pure Rust implementation, but the other side of the reference is held by
+        // C++, which has no qualms about multiple mutators.
+        //
+        // Since this occupies only a single byte - the fallout of mixing non-atomic (C++)
+        // and atomic (Rust) accesses should be minimal on x86 and Arm.
+        //
+        // If this type were more than 1 byte, however, we would have concerns about the
+        // non-atomic side technically being allowed to tear writes.
+        let atomic_bool: &AtomicBool = unsafe { AtomicBool::from_ptr(cancellation_token) };
+        let cancelation = diskann_quantization::cancel::AtomicCancelation::new(atomic_bool);
+
+        let result = trainer
+            .train(
+                MatrixView::try_from(
+                    train_data.as_slice(),
+                    parameters.num_train(),
+                    parameters.dim(),
+                )
+                .bridge_err()?,
+                chunk_offsets_view,
+                diskann_quantization::Parallelism::Rayon,
+                &rng_builder,
+                &cancelation,
+            )
+            .map_err(ANNError::new)?
+            .flatten();
+        Ok(result)
+    })?;
+
+    full_pivot_data.copy_from_slice(&trained);
+    Ok(())
+}
+
+/// Calculates the centroid if needed and moves the train_data to to the centroid
+/// # Arguments
+/// * `train_data` Dataset
+/// * `num_points` Number of points in the dataset
+/// * `dimensions` Number of dimensions in the dataset
+/// * `translate_to_center` True to move the training data to the calculated centroid.  False to leave the training
+///   data in its original location
+/// * `centroid` An output vector of centroids, where the size is equal to the number of dimensions.
+///
+/// # Panics
+/// Panics under the following condition:
+///
+/// * `train_data.len() != num_points * dimensions`.
+/// * `centroid.len() != dimensions`.
+#[inline]
+pub fn move_train_data_by_centroid(
+    train_data: &mut [f32],
+    num_points: usize,
+    dimensions: usize,
+    centroid: &mut [f32],
+) {
+    assert_eq!(train_data.len(), num_points * dimensions);
+    assert_eq!(centroid.len(), dimensions);
+
+    // Calculate centroid and center of the training data
+    // If we use L2 distance, there is an option to
+    // translate all vectors to make them centered and
+    // then compute PQ. This needs to be set to false
+    // when using PQ for MIPS as such translations dont
+    // preserve inner products.
+    centroid.fill(0.0);
+    for row in train_data.chunks_exact_mut(dimensions) {
+        for (c, r) in std::iter::zip(centroid.iter_mut(), row.iter()) {
+            *c += *r;
+        }
+    }
+    centroid.iter_mut().for_each(|c| *c /= num_points as f32);
+
+    // Remove the mean from each chunk in the input train data.
+    for row in train_data.chunks_exact_mut(dimensions) {
+        for (r, c) in std::iter::zip(row.iter_mut(), centroid.iter()) {
+            *r -= *c;
+        }
+    }
+}
+
+/// Add `y` to every row of `x`.
+///
+/// # Panics
+///
+/// Panics if `y.len() != x.ncols()`.
+pub fn accum_row_inplace<T>(mut x: MutMatrixView<T>, y: &[T])
+where
+    T: Copy + std::ops::AddAssign,
+{
+    assert_eq!(x.ncols(), y.len());
+    x.row_iter_mut().for_each(|row| {
+        std::iter::zip(row.iter_mut(), y.iter()).for_each(|(a, b)| {
+            *a += *b;
+        });
+    });
+}
+
+/// streams the base file (data_file), and computes the closest centers in each
+/// chunk to generate the compressed data_file and stores it in
+/// pq_compressed_vectors_path.
+/// If the numbber of centers is < 256, it stores as byte vector, else as
+/// 4-byte vector in binary format.
+/// Compressed PQ table layout: {num_points: usize}{num_chunks: usize}{compressed pq table: [num_points; num_chunks]}
+/// It will start from the start_vector_id and compress the data_file in chunks.
+/// It validates the existing compressed data_file is consistent with the start_vector_id.
+pub fn generate_pq_data_from_pivots<T, Storage>(
+    num_centers: usize,
+    num_pq_chunks: usize,
+    pq_storage: &mut PQStorage,
+    storage_provider: &Storage,
+    offset: usize,
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<()>
+where
+    T: Copy + VectorRepr,
+    Storage: StorageWriteProvider + StorageReadProvider,
+{
+    let timer = Instant::now();
+
+    info!("Generating PQ data starting from offset {}", offset);
+
+    let uncompressed_data_reader =
+        &mut storage_provider.open_reader(pq_storage.get_data_path()?)?;
+
+    let mut compressed_data_writer = if offset > 0 {
+        storage_provider.open_writer(pq_storage.get_compressed_data_path())?
+    } else {
+        storage_provider.create_for_write(pq_storage.get_compressed_data_path())?
+    };
+
+    let (num_points, dim) = Metadata::read(uncompressed_data_reader)?.into_dims();
+
+    let full_dim: usize;
+    let table;
+
+    if !pq_storage.pivot_data_exist(storage_provider) {
+        return Err(ANNError::message("ERROR: PQ k-means pivot file not found."));
+    } else {
+        (_, full_dim) = pq_storage.read_existing_pivot_metadata(storage_provider)?;
+        table = pq_storage.load_pivots(storage_provider)?;
+
+        if table.nchunks() != num_pq_chunks
+            || table.ncenters() != num_centers
+            || table.dim() != full_dim
+        {
+            return Err(ANNError::message(format!(
+                "PQ pivot table mismatch: file has {} chunks, {} centers in {} dimensions but expected {} chunks, {} centers in {} dimensions.",
+                table.nchunks(),
+                table.ncenters(),
+                table.dim(),
+                num_pq_chunks,
+                num_centers,
+                full_dim
+            )));
+        }
+    }
+
+    pq_storage.write_compressed_pivot_metadata::<Storage>(
+        num_points,
+        num_pq_chunks,
+        &mut compressed_data_writer,
+    )?;
+
+    const CHUNKING_BLOCK_SIZE: usize = 10_000;
+
+    let block_size = if num_points <= CHUNKING_BLOCK_SIZE {
+        num_points
+    } else {
+        CHUNKING_BLOCK_SIZE
+    };
+
+    let num_points_to_compress = num_points - offset;
+    let num_blocks = (num_points_to_compress / block_size)
+        + !num_points_to_compress.is_multiple_of(block_size) as usize;
+
+    uncompressed_data_reader.seek(SeekFrom::Start(
+        (size_of::<i32>() * 2 + offset * dim * size_of::<T>()) as u64,
+    ))?;
+
+    // The compression table.
+    let table = TransposedTable::from_parts(table.view_pivots(), table.view_offsets().to_owned())
+        .map_err(|err| ANNError::message(diskann_quantization::error::format(&err)))?;
+
+    let mut buffer = vec![0.0; full_dim * block_size];
+
+    for block_index in 0..num_blocks {
+        let start_index: usize = offset + block_index * block_size;
+        let end_index: usize = std::cmp::min(start_index + block_size, num_points);
+        let cur_block_size: usize = end_index - start_index;
+
+        let mut block_compressed_base: Vec<u8> = vec![0; cur_block_size * num_pq_chunks];
+
+        let block_data: Vec<T> = read_exact_into(uncompressed_data_reader, cur_block_size * dim)?;
+
+        for (dst, src) in buffer
+            .chunks_exact_mut(full_dim)
+            .zip(block_data.chunks_exact(dim))
+        {
+            T::as_f32_into(src, dst).into_ann_result()?;
+        }
+
+        let block_data = &buffer[..cur_block_size * full_dim];
+
+        // We need some batch size of data to pass to `compress`. There is a balance
+        // to achieve here. It must be:
+        //
+        // 1. Small enough to allow for parallelism across threads/tasks.
+        // 2. Large enough to take advantage of cache locality in `compress`.
+        //
+        // A value of 128 is a somewhat arbitrary compromise, meaning each task will
+        // process `BATCH_SIZE` many dataset vectors at a time.
+        const BATCH_SIZE: usize = 128;
+
+        // Wrap the data in `MatrixViews` so we do not need to manually construct view
+        // in the compression loop.
+        let mut compressed_block =
+            MutMatrixView::try_from(&mut block_compressed_base, cur_block_size, num_pq_chunks)
+                .bridge_err()?;
+        let base_block = MatrixView::try_from(block_data, cur_block_size, full_dim).bridge_err()?;
+
+        base_block
+            .par_window_iter(BATCH_SIZE)
+            .zip_eq(compressed_block.par_window_iter_mut(BATCH_SIZE))
+            .try_for_each_in_pool(pool, |(src, dst)| {
+                table.compress_into(src, dst).map_err(ANNError::new)
+            })?;
+
+        let offset = start_index * num_pq_chunks + std::mem::size_of::<i32>() * 2;
+        compressed_data_writer.seek(SeekFrom::Start(offset as u64))?;
+        compressed_data_writer.write_all(&block_compressed_base)?;
+    }
+
+    info!(
+        "PQ data generation took {} seconds",
+        timer.elapsed().as_secs_f64()
+    );
+
+    Ok(())
+}
+
+/// Compute PQ codes for a batch of vectors using in-memory pivots.
+///
+/// Given vector data with dimensions from `parameters` and PQ pivots computed
+/// earlier, partition the coordinates into `num_pq_chunks` and find the closest
+/// pivot for each vector chunk. This API does not read or write storage.
+pub fn generate_pq_data_from_pivots_from_membuf_batch<T: VectorRepr + Sync>(
+    parameters: &GeneratePivotArguments,
+    vector_data: &[T],
+    pivot_data: &[f32],
+    offsets: &[usize],
+    pq_out: &mut [u8],
+    pool: RayonThreadPoolRef<'_>,
+) -> ANNResult<()> {
+    // Perform minimal error checking at this level, mainly on the sizes of `vector_data`
+    // and `pq_out`.
+    //
+    // More dimensionality checking is deferred to the table construction.
+    let num_train = parameters.num_train();
+    let num_pq_chunks = parameters.num_pq_chunks();
+    let dim = parameters.dim();
+
+    if vector_data.len() != num_train * dim {
+        return Err(ANNError::message(
+            "Error: Vector data length has the incorrect size!",
+        ));
+    }
+    if pq_out.len() != num_train * num_pq_chunks {
+        return Err(ANNError::message("Error: Invalid PQ buffer input size."));
+    }
+
+    let table = BasicTableView::new(
+        MatrixView::try_from(pivot_data, parameters.num_centers(), dim).bridge_err()?,
+        ChunkOffsetsView::new(offsets).bridge_err()?,
+    )
+    .map_err(|err| ANNError::message(diskann_quantization::error::format(&err)))?;
+
+    pq_out
+        .par_chunks_mut(num_pq_chunks)
+        .zip(vector_data.par_chunks(dim))
+        .try_for_each_in_pool(pool, |(pq_slice, vector)| {
+            let data = T::as_f32(vector).map_err(ANNError::new)?;
+            table.compress_into(&*data, pq_slice).map_err(ANNError::new)
+        })
+}
+
+#[cfg(test)]
+mod pq_test {
+    use std::{f32, io::Write};
+
+    use crate::storage::VirtualStorageProvider;
+    use approx::assert_relative_eq;
+    use diskann::utils::IntoUsize;
+    use diskann_utils::test_data_root;
+    use rand_distr::{Distribution, Uniform};
+    use rstest::rstest;
+    use vfs::OverlayFS;
+
+    use super::*;
+    use crate::{
+        model::{
+            FixedChunkPQTable,
+            pq::{METADATA_SIZE, debug},
+        },
+        utils::{ParallelIteratorInPool, create_thread_pool_for_test, read_bin_from},
+    };
+
+    /// Test helper: Gets all instances of a chunk from the training data for all records
+    /// in the training data. Each vector in the training dataset is divided into chunks
+    /// and the PQ algorithm handles each vector chunk individually. This helper gets the
+    /// same chunk from each vector in the training data and returns it as a flat vector.
+    fn get_chunk_from_training_data(
+        train_data: &[f32],
+        num_train: usize,
+        raw_vector_dim: usize,
+        chunk_size: usize,
+        chunk_offset: usize,
+    ) -> Vec<f32> {
+        let mut result: Vec<f32> = vec![0.0; num_train * chunk_size];
+        result
+            .chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_number, result_chunk)| {
+                let train_data_start = chunk_number * raw_vector_dim + chunk_offset;
+                let train_data_end = train_data_start + chunk_size;
+                result_chunk.copy_from_slice(&train_data[train_data_start..train_data_end]);
+            });
+        result
+    }
+
+    #[test]
+    fn test_move_train_data_by_centroid() {
+        let dim = 20;
+        let num_data = 200;
+        let val: f32 = 1.0;
+
+        let mut data = vec![val; dim * num_data];
+        let mut centroid = vec![0.0; dim];
+        move_train_data_by_centroid(&mut data, num_data, dim, &mut centroid);
+        assert!(centroid.iter().all(|&i| i == val));
+        assert!(data.iter().all(|&i| i == 0.0));
+    }
+
+    #[test]
+    fn generate_pq_pivots_test() {
+        let storage_provider = VirtualStorageProvider::new_memory();
+
+        let pivot_file_name = "/generate_pq_pivots_test3.bin";
+        let compressed_file_name = "/compressed2.bin";
+        let pq_training_file_name = "/file_not_used.bin";
+        let pq_storage: PQStorage = PQStorage::new(
+            pivot_file_name,
+            compressed_file_name,
+            Some(pq_training_file_name),
+        );
+
+        let mut train_data: Vec<f32> = vec![
+            1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 2.0f32, 2.0f32, 2.0f32,
+            2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32,
+            2.1f32, 2.1f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32,
+            100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32,
+        ];
+        let pool = create_thread_pool_for_test();
+        generate_pq_pivots(
+            GeneratePivotArguments::new(5, 8, 2, 2, 5).unwrap(),
+            true,
+            &mut train_data,
+            &pq_storage,
+            &storage_provider,
+            crate::utils::create_rnd_provider_from_seed_in_tests(42),
+            pool.as_ref(),
+        )
+        .unwrap();
+
+        let mut reader = storage_provider.open_reader(pivot_file_name).unwrap();
+        let offsets = read_bin_from::<u64>(&mut reader, 0).unwrap();
+        let file_offset_data = offsets.map(|x| x.into_usize());
+        assert_eq!(file_offset_data[(0, 0)], METADATA_SIZE);
+        assert_eq!(offsets.nrows(), 4);
+        assert_eq!(offsets.ncols(), 1);
+
+        let pivots = read_bin_from::<f32>(&mut reader, file_offset_data[(0, 0)]).unwrap();
+
+        assert_eq!(pivots.as_slice().len(), 16);
+        assert_eq!(pivots.nrows(), 2);
+        assert_eq!(pivots.ncols(), 8);
+
+        let centroid = read_bin_from::<f32>(&mut reader, file_offset_data[(1, 0)]).unwrap();
+        assert_eq!(
+            centroid[(0, 0)],
+            (1.0f32 + 2.0f32 + 2.1f32 + 2.2f32 + 100.0f32) / 5.0f32
+        );
+        assert_eq!(centroid.nrows(), 8);
+        assert_eq!(centroid.ncols(), 1);
+
+        let chunk_offsets = read_bin_from::<u32>(&mut reader, file_offset_data[(2, 0)])
+            .unwrap()
+            .map(|x| x.into_usize());
+        assert_eq!(chunk_offsets[(0, 0)], 0);
+        assert_eq!(chunk_offsets[(1, 0)], 4);
+        assert_eq!(chunk_offsets[(2, 0)], 8);
+        assert_eq!(chunk_offsets.nrows(), 3);
+        assert_eq!(chunk_offsets.ncols(), 1);
+    }
+
+    #[rstest]
+    #[case(2)]
+    #[case(3)]
+    fn generate_pq_pivots_membuf_test(#[case] num_pq_chunks: usize) {
+        let num_train = 5;
+        let dim = 8;
+        let num_centers = 2;
+
+        let train_data: [f32; 40] = [
+            1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 2.0f32, 2.0f32, 2.0f32,
+            2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32,
+            2.1f32, 2.1f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32,
+            100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32,
+        ];
+
+        let mut full_pivot_data: Vec<f32> = vec![0.0; num_centers * dim];
+        let mut offsets: Vec<usize> = vec![0; num_pq_chunks + 1];
+        let pool = create_thread_pool_for_test();
+        let result = generate_pq_pivots_from_membuf(
+            &GeneratePivotArguments::new(num_train, dim, num_centers, num_pq_chunks, 5).unwrap(),
+            &train_data, // train_data
+            &mut offsets,
+            &mut full_pivot_data,
+            &mut crate::utils::create_rnd_in_tests(),
+            &mut (false),
+            pool.as_ref(),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(full_pivot_data.len(), 16);
+    }
+
+    #[test]
+    fn read_pivot_metadata_existing_test() {
+        // no real data except pivot data.
+        const DATA_FILE: &str = "/test/test/fake.bin";
+        const PQ_PIVOT_PATH: &str = "/sift/siftsmall_learn_pq_pivots.bin";
+        const PQ_COMPRESSED_PATH: &str = "/test/test/fake.bin";
+
+        let mut train_data = vec![0.0; 10 * 5];
+        let num_train = 10;
+        let dim = 128;
+        let num_centers = 256;
+        let num_pq_chunks = dim - 1;
+        let max_k_means_reps = 10;
+        let storage_provider = VirtualStorageProvider::new_overlay(test_data_root());
+        let pq_storage = PQStorage::new(PQ_PIVOT_PATH, PQ_COMPRESSED_PATH, Some(DATA_FILE));
+        let pool = create_thread_pool_for_test();
+        let result = generate_pq_pivots(
+            GeneratePivotArguments::new(
+                num_train,
+                dim,
+                num_centers,
+                num_pq_chunks,
+                max_k_means_reps,
+            )
+            .unwrap(),
+            true,
+            &mut train_data,
+            &pq_storage,
+            &storage_provider,
+            crate::utils::create_rnd_provider_from_seed_in_tests(42),
+            pool.as_ref(),
+        );
+
+        // still succeed without training data
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn generate_pq_data_from_pivots_test() {
+        let storage_provider = VirtualStorageProvider::new_memory();
+        let data_file = "/generate_pq_data_from_pivots_test_data.bin";
+        //npoints=5, dim=8, 5 vectors [1.0;8] [2.0;8] [2.1;8] [2.2;8] [100.0;8]
+        let mut train_data: Vec<f32> = vec![
+            1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 2.0f32, 2.0f32, 2.0f32,
+            2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32,
+            2.1f32, 2.1f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32,
+            100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32,
+        ];
+        // Casting Pod types (f32, i32) to bytes always succeeds (u8 has alignment of 1)
+        let my_nums_unstructured: &[u8] = bytemuck::must_cast_slice(&train_data);
+        let meta: Vec<i32> = vec![5, 8];
+        let meta_unstructured: &[u8] = bytemuck::must_cast_slice(&meta);
+        {
+            let mut data_file_writer = storage_provider.create_for_write(data_file).unwrap();
+            data_file_writer
+                .write_all(meta_unstructured)
+                .expect("Failed to write sample file");
+            data_file_writer
+                .write_all(my_nums_unstructured)
+                .expect("Failed to write sample file");
+        }
+        let pq_pivots_path = "/generate_pq_data_from_pivots_test_pivot.bin";
+        let pq_compressed_vectors_path = "/generate_pq_data_from_pivots_test.bin";
+        let mut pq_storage =
+            PQStorage::new(pq_pivots_path, pq_compressed_vectors_path, Some(data_file));
+        let pool = create_thread_pool_for_test();
+        generate_pq_pivots(
+            GeneratePivotArguments::new(5, 8, 2, 2, 5).unwrap(),
+            true,
+            &mut train_data,
+            &pq_storage,
+            &storage_provider,
+            crate::utils::create_rnd_provider_from_seed_in_tests(42),
+            pool.as_ref(),
+        )
+        .unwrap();
+        generate_pq_data_from_pivots::<f32, _>(
+            2,
+            2,
+            &mut pq_storage,
+            &storage_provider,
+            0,
+            pool.as_ref(),
+        )
+        .unwrap();
+        let compressed = read_bin_from::<u8>(
+            &mut storage_provider
+                .open_reader(pq_compressed_vectors_path)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(compressed.nrows(), 5);
+        assert_eq!(compressed.ncols(), 2);
+        assert_eq!(compressed[(0, 0)], compressed[(1, 0)]);
+        assert_ne!(compressed[(0, 0)], compressed[(4, 0)]);
+
+        storage_provider.delete(data_file).unwrap();
+        storage_provider.delete(pq_pivots_path).unwrap();
+        storage_provider.delete(pq_compressed_vectors_path).unwrap();
+    }
+
+    #[rstest]
+    #[case(2)]
+    #[case(3)]
+    fn generate_pq_data_from_pivots_membuf_test(#[case] num_pq_chunks: usize) {
+        let num_train: usize = 5;
+        let dim: usize = 8;
+        let num_centers: usize = 2;
+        let max_k_means_reps: usize = 5;
+
+        let train_data: Vec<f32> = vec![
+            1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 2.0f32, 2.0f32, 2.0f32,
+            2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.0f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32, 2.1f32,
+            2.1f32, 2.1f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32, 2.2f32,
+            100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32, 100.0f32,
+        ];
+
+        let mut offsets: Vec<usize> = vec![usize::MAX; num_pq_chunks + 1];
+        let mut pivot_data: Vec<f32> = vec![f32::MAX; num_centers * dim];
+        let pool = create_thread_pool_for_test();
+        generate_pq_pivots_from_membuf(
+            &GeneratePivotArguments::new(
+                num_train,
+                dim,
+                num_centers,
+                num_pq_chunks,
+                max_k_means_reps,
+            )
+            .unwrap(),
+            &train_data,
+            &mut offsets,
+            &mut pivot_data,
+            &mut crate::utils::create_rnd_in_tests(),
+            &mut (false),
+            pool.as_ref(),
+        )
+        .unwrap();
+
+        let table = FixedChunkPQTable::new(dim, pivot_data.into(), offsets.into()).unwrap();
+        let mut pq: Vec<u8> = vec![0; num_pq_chunks];
+        for i in 0..num_train {
+            table
+                .compress_into(&train_data[dim * i..dim * (i + 1)], &mut pq)
+                .unwrap();
+        }
+
+        assert!(!table.get_chunk_offsets().contains(&usize::MAX));
+        assert!(!table.get_pq_table().contains(&f32::MAX));
+    }
+
+    #[rstest]
+    #[case(false, 16)]
+    #[case(false, 32)]
+    #[case(false, 17)]
+    #[case(false, 13)]
+    fn verify_identical_results_for_membuf_api(
+        #[case] legacy_center_data: bool,
+        #[case] num_pq_chunks: usize,
+    ) {
+        // Creates a new filesystem using a read/write MemoryFS with PhysicalFS as a fall-back read-only filesystem.
+        let storage_provider = VirtualStorageProvider::new_overlay(test_data_root());
+
+        let data_file = "/sift/siftsmall_learn.bin";
+        let pq_pivots_path = "/pq_pivots_validation.bin";
+        let pq_compressed_vectors_path = "/pq_validation.bin";
+        let mut pq_storage: PQStorage =
+            PQStorage::new(pq_pivots_path, pq_compressed_vectors_path, Some(data_file));
+        let pool = create_thread_pool_for_test();
+        // use original function to generate pq pivots and pq data
+
+        let (mut full_data_vector, num_train, train_dim) = pq_storage
+            .get_random_train_data_slice::<f32, VirtualStorageProvider<OverlayFS>>(
+                1.0,
+                &storage_provider,
+                &mut crate::utils::create_rnd_in_tests(),
+            )
+            .unwrap();
+
+        generate_pq_pivots(
+            GeneratePivotArguments::new(
+                num_train,
+                train_dim,
+                NUM_PQ_CENTROIDS,
+                num_pq_chunks,
+                NUM_KMEANS_REPS_PQ,
+            )
+            .expect("Failed to create pivot parameters"),
+            legacy_center_data,
+            &mut full_data_vector,
+            &pq_storage,
+            &storage_provider,
+            crate::utils::create_rnd_provider_from_seed_in_tests(42),
+            pool.as_ref(),
+        )
+        .expect("Failed to generate pivots");
+
+        generate_pq_data_from_pivots::<f32, _>(
+            NUM_PQ_CENTROIDS,
+            num_pq_chunks,
+            &mut pq_storage,
+            &storage_provider,
+            0,
+            pool.as_ref(),
+        )
+        .expect("Failed to generate quantized data");
+
+        // use membuf function to generate pq
+
+        // use pivot data generated by original function
+        let table = pq_storage.load_pivots(&storage_provider).unwrap();
+        assert_eq!(table.nchunks(), num_pq_chunks);
+        assert_eq!(table.ncenters(), NUM_PQ_CENTROIDS);
+        assert_eq!(table.dim(), train_dim);
+        let mut membuf_pq_data: Vec<u8> = vec![0; num_pq_chunks * num_train];
+
+        // `from_membuf` switched to an implementation optimized for a single vector.
+        // To accomodate comparison, we need to invoke this method for each vector in our
+        // dataset.
+
+        membuf_pq_data
+            .par_chunks_mut(num_pq_chunks)
+            .enumerate()
+            .for_each_in_pool(pool.as_ref(), |(i, membuf_slice)| {
+                table
+                    .compress_into(
+                        &full_data_vector[train_dim * i..train_dim * (i + 1)],
+                        membuf_slice,
+                    )
+                    .unwrap();
+            });
+
+        // use pq generated by original function as the gt
+        let original_pq_data = read_bin_from::<u8>(
+            &mut storage_provider
+                .open_reader(pq_compressed_vectors_path)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+
+        let membuf_view =
+            MatrixView::try_from(membuf_pq_data.as_slice(), num_train, num_pq_chunks).unwrap();
+
+        let original_view =
+            MatrixView::try_from(original_pq_data.as_slice(), num_train, num_pq_chunks).unwrap();
+
+        // Pre-emptively construct an offset view to compare mismatched slices.
+        // We want to check that the difference in the mismatched chunks is small.
+        let chunk_offsets = ChunkOffsets::partition(
+            NonZeroUsize::new(train_dim).unwrap(),
+            NonZeroUsize::new(num_pq_chunks).unwrap(),
+        )
+        .unwrap();
+        let offset_view = chunk_offsets.as_view();
+        let full_data =
+            MatrixView::try_from(full_data_vector.as_slice(), num_train, train_dim).unwrap();
+        let pivot_view = table.view_pivots();
+        let centroid = vec![0.0; train_dim];
+
+        // Due to difference in numerical rounding, the results between the two APIs can
+        // vary slightly.
+        //
+        // In our checking routine, we do a bunch of work to determining the centers that
+        // were mismatched and to compute the relative error between these two centers.
+        //
+        // IF the relative error between the two is small enough, then we are okay with
+        // the mismatch.
+        let max_relative_error = 2.05e-5;
+        // The maximum number of mismatches allowed.
+        let max_mismatches = 6;
+
+        let mismatch_records = debug::compare_pq(
+            full_data,
+            offset_view,
+            pivot_view,
+            &centroid,
+            membuf_view,
+            original_view,
+        );
+
+        let mut max_relative_error_seen: f32 = 0.0;
+        mismatch_records.iter().enumerate().for_each(|(i, r)| {
+            println!("Mismatch {} of {}\n", i + 1, mismatch_records.len());
+            println!("{}", r);
+            let relative_error = (r.squared_l2_a - r.squared_l2_b).abs() / (r.squared_l2_b);
+            println!("relative error = {relative_error}");
+            max_relative_error_seen = max_relative_error_seen.max(relative_error)
+        });
+
+        assert!(
+            max_relative_error_seen <= max_relative_error,
+            "observed max relative error {max_relative_error_seen} exceeds the configured \
+                 upper bound of {max_relative_error}"
+        );
+        assert!(
+            mismatch_records.len() <= max_mismatches,
+            "observed {} mismatches when a maximum of {} was allowed",
+            mismatch_records.len(),
+            max_mismatches
+        );
+    }
+
+    enum RandGenStrategy {
+        HundredMaxMin,
+        ZeroToHundred,
+        UnitSphere,
+        RandDivByRand,
+    }
+
+    #[rstest]
+    #[case(16, 8)]
+    #[case(8, 3)]
+    #[case(7, 5)]
+    #[case(10, 5)]
+    #[case(20, 2)]
+    #[case(3, 3)]
+    fn check_pq_api_for_membuf_runs_with_rand_f32_data(
+        #[values(
+            RandGenStrategy::HundredMaxMin,
+            RandGenStrategy::ZeroToHundred,
+            RandGenStrategy::UnitSphere,
+            RandGenStrategy::RandDivByRand
+        )]
+        rand_strategy: RandGenStrategy,
+        #[values(256)] npts: usize,
+        #[case] dim: usize,
+        #[case] num_pq_chunks: usize,
+    ) {
+        let mut rng = crate::utils::create_rnd_provider_from_seed(42).create_rnd();
+        let full_data_vector: Vec<f32> = match rand_strategy {
+            RandGenStrategy::HundredMaxMin => (0..npts * dim)
+                .map(|_| rng.random_range(-100.0..100.0))
+                .collect(),
+            RandGenStrategy::ZeroToHundred => (0..npts * dim)
+                .map(|_| rng.random_range(0.0..100.0))
+                .collect(),
+            RandGenStrategy::UnitSphere => {
+                let mut data: Vec<f32> = (0..npts * dim)
+                    .map(|_| rng.random_range(-100.0..100.0))
+                    .collect();
+                let norms: Vec<f32> = data
+                    .chunks(dim)
+                    .map(|v| v.iter().map(|x| x * x).sum::<f32>().sqrt())
+                    .collect();
+                for (slice, norm) in data.chunks_mut(dim).zip(norms) {
+                    for iter in slice.iter_mut() {
+                        *iter /= norm;
+                    }
+                }
+                data
+            }
+            RandGenStrategy::RandDivByRand => (0..npts * dim)
+                .map(|_| rng.random_range(0.0..100.0) / rng.random_range(f32::EPSILON..100.0))
+                .collect(),
+        };
+
+        // Generate pivot data
+        let mut full_pivot_data: Vec<f32> = vec![0.0; NUM_PQ_CENTROIDS * dim];
+        let mut offsets: Vec<usize> = vec![0; num_pq_chunks + 1];
+        let pool = create_thread_pool_for_test();
+        let result = generate_pq_pivots_from_membuf(
+            &GeneratePivotArguments::new(
+                npts,
+                dim,
+                NUM_PQ_CENTROIDS,
+                num_pq_chunks,
+                crate::model::pq::pq_construction::NUM_KMEANS_REPS_PQ,
+            )
+            .unwrap(),
+            &full_data_vector,
+            &mut offsets,
+            &mut full_pivot_data,
+            &mut crate::utils::create_rnd_in_tests(),
+            &mut (false),
+            pool.as_ref(),
+        );
+        assert!(result.is_ok());
+
+        let table = FixedChunkPQTable::new(dim, full_pivot_data.into(), offsets.into()).unwrap();
+        let mut membuf_pq_data: Vec<u8> = vec![0; num_pq_chunks];
+        for i in 0..npts {
+            let result = table.compress_into(
+                &full_data_vector[(dim * i)..(dim * (i + 1))],
+                &mut membuf_pq_data,
+            );
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn pq_end_to_end_validation_with_codebook_test() {
+        // Creates a new filesystem using a read/write MemoryFS with PhysicalFS as a fall-back read-only filesystem.
+        let storage_provider = VirtualStorageProvider::new_overlay(test_data_root());
+
+        let data_file = "/sift/siftsmall_learn.bin";
+        let pq_pivots_path = "/sift/siftsmall_learn_pq_pivots.bin";
+        let ground_truth_path = "/sift/siftsmall_learn_pq_compressed.bin";
+        let pq_compressed_vectors_path = "/validation.bin";
+        let mut pq_storage =
+            PQStorage::new(pq_pivots_path, pq_compressed_vectors_path, Some(data_file));
+
+        let pool = create_thread_pool_for_test();
+
+        generate_pq_data_from_pivots::<f32, _>(
+            NUM_PQ_CENTROIDS,
+            1,
+            &mut pq_storage,
+            &storage_provider,
+            0,
+            pool.as_ref(),
+        )
+        .expect("Failed to generate quantized data");
+
+        let data = read_bin_from::<u8>(
+            &mut storage_provider
+                .open_reader(pq_compressed_vectors_path)
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        let gt_data = read_bin_from::<u8>(
+            &mut storage_provider.open_reader(ground_truth_path).unwrap(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(data, gt_data);
+    }
+
+    #[test]
+    fn get_chunk_from_training_data_chunk0() {
+        // train_data contains 2 vectors of dimension 7.  [0.0-0.6] and [1.0-1.6]
+        let train_data = vec![
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+        ];
+
+        let result = get_chunk_from_training_data(
+            &train_data,
+            2, /* 2 vectors in dataset */
+            7, /* Each vector is dimension 7 */
+            3, /* Current chunk is size 3 */
+            0, /* Get chunk 0 for each vector */
+        );
+
+        // 0.0, 0.1, 0.2 are the first chunk of the first vector
+        // 1.0, 1.1, 1.2 are the first chunk of the second vector
+        assert_eq!(result, vec!(0.0, 0.1, 0.2, 1.0, 1.1, 1.2));
+    }
+
+    #[test]
+    fn get_chunk_from_training_data_chunk1() {
+        // train_data contains 2 vectors of dimension 7.  [0.0-0.6] and [1.0-1.6]
+        let train_data = vec![
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+        ];
+
+        let chunk_id = 1;
+        let chunk_size = 3;
+        let chunk_offset = chunk_size * chunk_id;
+
+        let result = get_chunk_from_training_data(
+            &train_data,
+            2,            /* 2 vectors in dataset */
+            7,            /* Each vector is dimension 7 */
+            chunk_size,   /* Current chunk is size 3 */
+            chunk_offset, /* Get chunk 1 for each vector */
+        );
+
+        // 0.0, 0.1, 0.2 are the first chunk of the first vector
+        // 1.0, 1.1, 1.2 are the first chunk of the second vector
+        assert_eq!(result, vec!(0.3, 0.4, 0.5, 1.3, 1.4, 1.5));
+    }
+
+    #[rstest]
+    #[case("l2", 31)]
+    #[case("l2", 32)]
+    #[case("inner_product", 31)]
+    fn rerankingtest_with_membuf_pq_functions(
+        #[case] distance_function: String,
+        #[case] num_pq_chunks: usize,
+    ) {
+        // Creates a new filesystem using a read/write MemoryFS with PhysicalFS as a fall-back read-only filesystem.
+        let storage_provider = VirtualStorageProvider::new_overlay(test_data_root());
+
+        let data_file = "/sift/siftsmall_learn.bin";
+        let pq_pivots_path = "/pq_pivots_validation.bin";
+        let pq_compressed_vectors_path = "/pq_validation.bin";
+        let pq_storage: PQStorage =
+            PQStorage::new(pq_pivots_path, pq_compressed_vectors_path, Some(data_file));
+        let num_runs = 1;
+        let num_closest_pq_vectors = 100;
+        let num_closest_gt_vectors = 10;
+        let p_val = 0.1;
+
+        let (train_data_vector, train_size, train_dim) = pq_storage
+            .get_random_train_data_slice::<f32, VirtualStorageProvider<OverlayFS>>(
+                p_val,
+                &storage_provider,
+                &mut crate::utils::create_rnd_in_tests(),
+            )
+            .unwrap();
+
+        // Generate pivot data
+        let mut full_pivot_data: Vec<f32> = vec![0.0; NUM_PQ_CENTROIDS * train_dim];
+        let mut offsets: Vec<usize> = vec![0; num_pq_chunks + 1];
+        let pivot_args = GeneratePivotArguments::new(
+            train_size,
+            train_dim,
+            NUM_PQ_CENTROIDS,
+            num_pq_chunks,
+            crate::model::pq::pq_construction::NUM_KMEANS_REPS_PQ,
+        )
+        .unwrap();
+        let pool = create_thread_pool_for_test();
+
+        generate_pq_pivots_from_membuf(
+            &pivot_args,
+            &train_data_vector,
+            &mut offsets,
+            &mut full_pivot_data,
+            &mut crate::utils::create_rnd_in_tests(),
+            &mut (false),
+            pool.as_ref(),
+        )
+        .unwrap();
+
+        // use membuf function to generate pq data
+        let (mut full_data_vector, train_size, train_dim) = pq_storage
+            .get_random_train_data_slice::<f32, VirtualStorageProvider<OverlayFS>>(
+                1.0,
+                &storage_provider,
+                &mut crate::utils::create_rnd_in_tests(),
+            )
+            .unwrap();
+
+        // Update the pivot arguments with the full number of dataset elements.
+        let pivot_args = GeneratePivotArguments::new(
+            train_size,
+            pivot_args.dim(),
+            pivot_args.num_centers(),
+            pivot_args.num_pq_chunks(),
+            pivot_args.max_k_means_reps(),
+        )
+        .unwrap();
+
+        let pool = create_thread_pool_for_test();
+        let mut pq_data: Vec<u8> = vec![0; num_pq_chunks * train_size];
+        generate_pq_data_from_pivots_from_membuf_batch(
+            &pivot_args,
+            &full_data_vector,
+            &full_pivot_data,
+            &offsets,
+            &mut pq_data,
+            pool.as_ref(),
+        )
+        .unwrap();
+
+        let fixed_chunk_pq_table =
+            FixedChunkPQTable::new(train_dim, full_pivot_data.into(), offsets.into()).unwrap();
+
+        // Hook into here to test pairwise distances.
+        let pairs = [(0, 1), (1, 0), (10, 10), (23, 42)];
+        for (a, b) in pairs {
+            let left = &pq_data[a * num_pq_chunks..(a + 1) * num_pq_chunks];
+            let right = &pq_data[b * num_pq_chunks..(b + 1) * num_pq_chunks];
+
+            let self_l2 = fixed_chunk_pq_table.qq_l2_distance(left, right);
+
+            let inflated = fixed_chunk_pq_table.inflate_vector(left);
+            let from_inflated = fixed_chunk_pq_table.l2_distance(&inflated, right);
+            assert_relative_eq!(self_l2, from_inflated, max_relative = 1e-6);
+        }
+
+        let mut rng = crate::utils::create_rnd_in_tests();
+        let int_distribution = Uniform::try_from(0..train_size).unwrap();
+
+        let mut counter_sum = vec![0; num_runs];
+
+        // Average over num_runs runs
+        for item in counter_sum.iter_mut().take(num_runs) {
+            let query_index = int_distribution.sample(&mut rng);
+
+            let mut query_vec =
+                full_data_vector[train_dim * query_index..train_dim * (query_index + 1)].to_vec();
+            let query = query_vec.as_mut_slice();
+
+            let mut distance_map: Vec<(f32, usize)> = Vec::new();
+
+            // Calculate the PQ distance with the PQ-compressed vectors
+            for i in 0..train_size {
+                if i == query_index {
+                    continue;
+                }
+                let compressed_data = pq_data[i * num_pq_chunks..(i + 1) * num_pq_chunks].to_vec();
+                match distance_function.as_str() {
+                    "l2" => {
+                        let distance = fixed_chunk_pq_table.l2_distance(query, &compressed_data);
+                        distance_map.push((distance, i));
+                    }
+                    "inner_product" => {
+                        let distance = fixed_chunk_pq_table.inner_product(query, &compressed_data);
+                        distance_map.push((distance, i));
+                    }
+                    _ => panic!("Invalid distance function"),
+                }
+            }
+
+            // Find the closest num_closest_pq_vectors vectors
+            distance_map.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let closest_pq_vectors: Vec<usize> = distance_map
+                .into_iter()
+                .take(num_closest_pq_vectors)
+                .map(|(_, value)| value)
+                .collect();
+
+            // Calculate the ground truth distance with the original data vectors
+            let mut gt_map: Vec<(f32, usize)> = Vec::new();
+            for i in 0..train_size {
+                if i == query_index {
+                    continue;
+                }
+
+                let data_vector = &mut full_data_vector[i * train_dim..(i + 1) * train_dim];
+                let mut distance = 0.0;
+                match distance_function.as_str() {
+                    "l2" => {
+                        for j in 0..train_dim {
+                            let diff = query[j] - data_vector[j];
+                            distance += diff * diff;
+                        }
+                        gt_map.push((distance, i));
+                    }
+                    "inner_product" => {
+                        for j in 0..train_dim {
+                            distance += query[j] * data_vector[j];
+                        }
+                        gt_map.push((-distance, i));
+                    }
+                    _ => panic!("Invalid distance function"),
+                }
+            }
+
+            // Find the closest 10 vectors
+            gt_map.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let closest_gt_vectors: Vec<usize> = gt_map
+                .into_iter()
+                .take(num_closest_gt_vectors)
+                .map(|(_, value)| value)
+                .collect();
+
+            // Find the closest 10 vectors that are also in the closest 100 PQ vectors
+            let counter = closest_gt_vectors
+                .iter()
+                .filter(|&point| closest_pq_vectors.contains(point))
+                .count();
+
+            //counter_sum += counter;
+            *item = counter;
+        }
+
+        // Calculate the average (over num_runs) recall as a percentage
+        let recall_percentage: f32 = ((counter_sum.iter().sum::<usize>() as f32 / num_runs as f32)
+            / num_closest_gt_vectors as f32)
+            * 100.0;
+        println!(
+            "\n\nOriginal data dimension: {}, Number of PQ chunks: {}",
+            train_dim, num_pq_chunks
+        );
+        println!(
+            "Data file: {}, Distance function: {}, Recall: {}",
+            data_file, distance_function, recall_percentage
+        );
+        assert!(recall_percentage > 90.0);
+    }
+}

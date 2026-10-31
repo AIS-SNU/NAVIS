@@ -1,0 +1,27 @@
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT license.
+ */
+mod fixed_chunk_pq_table;
+pub use fixed_chunk_pq_table::{
+    FixedChunkPQTable, compute_pq_distance, compute_pq_distance_for_pq_coordinates,
+    direct_distance_impl, pq_dist_lookup_single,
+};
+
+mod pq_construction;
+pub use pq_construction::{
+    MAX_PQ_TRAINING_SET_SIZE, NUM_KMEANS_REPS_PQ, NUM_PQ_CENTROIDS, accum_row_inplace,
+    generate_pq_data_from_pivots, generate_pq_data_from_pivots_from_membuf_batch,
+    generate_pq_pivots, generate_pq_pivots_from_membuf, move_train_data_by_centroid,
+};
+
+/// all metadata of individual sub-component files is written in first 4KB for unified files
+pub(crate) const METADATA_SIZE: usize = 4096;
+
+pub mod debug;
+pub mod distance;
+pub mod strided;
+pub mod views;
+
+pub mod generate_pivot_arguments;
+pub use generate_pivot_arguments::{GeneratePivotArguments, GeneratePivotArgumentsError};

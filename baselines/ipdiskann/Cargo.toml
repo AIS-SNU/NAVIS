@@ -1,0 +1,36 @@
+[workspace]
+# DiskANN3/ is its own workspace (the vendored crates inherit from it).
+exclude = ["DiskANN3"]
+
+[package]
+name = "navis-diskann3-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "=1.0.100"
+# 0.5.4 (the copied repository's stale lockfile selection) corrupts CPR
+# recovery under concurrent mutation. 0.5.6 contains the snapshot handshake
+# and sparse-page-table recovery fixes; DiskANN3's manifest permits 0.5.x.
+bf-tree = "=0.5.6"
+bytemuck = "=1.24.0"
+clap = { version = "=4.5.54", features = ["derive"] }
+futures-executor = "=0.3.32"
+rand = "=0.9.5"
+rayon = "=1.11.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+diskann = { path = "DiskANN3/diskann" }
+diskann-bftree = { path = "DiskANN3/diskann-bftree" }
+diskann-providers = { path = "DiskANN3/diskann-providers" }
+diskann-quantization = { path = "DiskANN3/diskann-quantization" }
+diskann-utils = { path = "DiskANN3/diskann-utils" }
+diskann-vector = { path = "DiskANN3/diskann-vector" }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"

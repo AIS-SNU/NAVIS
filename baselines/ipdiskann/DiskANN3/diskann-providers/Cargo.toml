@@ -1,0 +1,72 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+[package]
+name = "diskann-providers"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+edition = "2024"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bincode.workspace = true
+bytemuck = { workspace = true, features = ["must_cast"]}
+byteorder.workspace = true
+half = { workspace = true, features = ["bytemuck", "num-traits"] }
+hashbrown.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+diskann-vector = { workspace = true }
+rand_distr.workspace = true
+cfg-if.workspace = true
+diskann-wide = { workspace = true }
+arc-swap.workspace = true
+tracing.workspace = true
+diskann = { workspace = true }
+diskann-utils = { workspace = true }
+diskann-quantization = { workspace = true, features = ["rayon"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+tempfile = { workspace = true, optional = true }
+prost = "0.14.1"
+futures-util = { workspace = true, features = ["async-await"] }
+vfs = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+diskann = { workspace = true, features = ["testing"] }
+diskann-utils = { workspace = true, features = ["testing"] }
+itertools.workspace = true
+tempfile.workspace = true
+rstest.workspace = true
+tokio = { workspace = true, features = ["full"] }
+proptest.workspace = true
+vfs.workspace = true
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+]
+
+[features]
+default = []
+testing = ["dep:tempfile"]
+experimental_diversity_search = ["diskann/experimental_diversity_search"]
+virtual_storage = ["dep:vfs"]
+
+# Some 'cfg's in the source tree will be flagged by `cargo clippy -j 2 --workspace --no-deps --all-targets -- -D warnings`
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
+[lints.clippy]
+# Commenting out for now. It would give warnings.
+# undocumented_unsafe_blocks = "warn"
+uninlined_format_args = "allow"
+

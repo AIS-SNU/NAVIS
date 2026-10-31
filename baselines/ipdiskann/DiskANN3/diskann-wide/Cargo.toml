@@ -1,0 +1,22 @@
+[package]
+name = "diskann-wide"
+version.workspace = true
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition = "2024"
+
+[lints]
+clippy.undocumented_unsafe_blocks = "warn"
+clippy.uninlined_format_args = "allow"
+
+[dev-dependencies]
+paste.workspace = true
+rand.workspace = true
+half = { workspace = true, features = ["rand_distr", "num-traits", "bytemuck"] }
+bytemuck = { workspace = true, features = ["must_cast"] }
+
+[dependencies]
+cfg-if.workspace = true
+half.workspace = true
